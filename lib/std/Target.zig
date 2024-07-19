@@ -1198,8 +1198,8 @@ pub const Cpu = struct {
                 .spirv => .NONE,
                 .spirv32 => .NONE,
                 .spirv64 => .NONE,
-                .loongarch32 => .NONE,
-                .loongarch64 => .NONE,
+                .loongarch32 => .LOONGARCH,
+                .loongarch64 => .LOONGARCH,
             };
         }
 
