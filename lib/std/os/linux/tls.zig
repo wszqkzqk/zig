@@ -48,10 +48,33 @@ const TLSVariant = enum {
     VariantII,
 };
 
-const tls_variant = switch (native_arch) {
-    .arm, .armeb, .thumb, .aarch64, .aarch64_be, .riscv32, .riscv64, .mips, .mipsel, .mips64, .mips64el, .powerpc, .powerpcle, .powerpc64, .powerpc64le => TLSVariant.VariantI,
-    .x86_64, .x86, .sparc64 => TLSVariant.VariantII,
-    else => @compileError("undefined tls_variant for this architecture"),
+const current_variant: Variant = switch (native_arch) {
+    .arm,
+    .armeb,
+    .aarch64,
+    .aarch64_be,
+    .thumb,
+    .thumbeb,
+    => .I_original,
+    .loongarch32,
+    .loongarch64,
+    .m68k,
+    .mips,
+    .mipsel,
+    .mips64,
+    .mips64el,
+    .powerpc,
+    .powerpcle,
+    .powerpc64,
+    .powerpc64le,
+    .riscv32,
+    .riscv64,
+    => .I_modified,
+    .sparc64,
+    .x86,
+    .x86_64,
+    => .II,
+    else => @compileError("undefined TLS variant for this architecture"),
 };
 
 // Controls how many bytes are reserved for the Thread Control Block
@@ -152,7 +175,18 @@ pub fn setThreadPointer(addr: usize) void {
             const rc = linux.syscall1(.set_tls, addr);
             assert(rc == 0);
         },
-        .riscv64 => {
+        .m68k => {
+            const rc = linux.syscall1(.set_thread_area, addr);
+            assert(rc == 0);
+        },
+        .loongarch32, .loongarch64 => {
+            asm volatile (
+                \\ mv tp, %[addr]
+                :
+                : [addr] "r" (addr),
+            );
+        },
+        .riscv32, .riscv64 => {
             asm volatile (
                 \\ mv tp, %[addr]
                 :
