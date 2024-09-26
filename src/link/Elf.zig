@@ -151,6 +151,8 @@ comment_merge_section_index: ?MergeSection.Index = null,
 
 first_eflags: ?elf.Elf64_Word = null,
 
+incremental_cache: ?*Cache = null,
+
 /// When allocating, the ideal_capacity is calculated by
 /// actual_capacity + (actual_capacity / ideal_factor)
 const ideal_factor = 3;
@@ -199,6 +201,8 @@ pub fn createEmpty(
     else
         elf.VER_NDX_LOCAL;
 
+    const gpa = comp.gpa;
+
     // If using LLD to link, this code should produce an object file so that it
     // can be passed to LLD.
     // If using LLVM to generate the object file for the zig compilation unit,
@@ -228,6 +232,22 @@ pub fn createEmpty(
         .ptr_width = ptr_width,
         .page_size = page_size,
         .default_sym_version = default_sym_version,
+
+        .incremental_cache = switch (comp.cache_use) {
+            .whole => null,
+            .incremental => cache: {
+                const cache = try arena.create(Cache);
+                cache.* = .{
+                    .gpa = gpa,
+                    .manifest_dir = try comp.local_cache_directory.handle.makeOpenPath("xyz", .{}),
+                };
+                cache.addPrefix(.{ .path = null, .handle = std.fs.cwd() });
+                cache.addPrefix(comp.zig_lib_directory);
+                cache.addPrefix(comp.local_cache_directory);
+                cache.addPrefix(comp.global_cache_directory);
+                break :cache cache;
+            },
+        },
 
         .entry_name = switch (options.entry) {
             .disabled => null,
@@ -291,8 +311,6 @@ pub fn createEmpty(
         .read = true,
         .mode = link.File.determineMode(use_lld, output_mode, link_mode),
     });
-
-    const gpa = comp.gpa;
 
     // Append null file at index 0
     try self.files.append(gpa, .null);
@@ -771,188 +789,196 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
     if (self.base.isStaticLib()) return relocatable.flushStaticLib(self, comp, module_obj_path);
     if (self.base.isObject()) return relocatable.flushObject(self, comp, module_obj_path);
 
-    const csu = try CsuObjects.init(arena, comp);
-    const compiler_rt_path: ?[]const u8 = blk: {
-        if (comp.compiler_rt_lib) |x| break :blk x.full_object_path;
-        if (comp.compiler_rt_obj) |x| break :blk x.full_object_path;
-        break :blk null;
-    };
-
-    // Here we will parse input positional and library files (if referenced).
-    // This will roughly match in any linker backend we support.
-    var positionals = std.ArrayList(Compilation.LinkObject).init(arena);
-
-    // csu prelude
-    if (csu.crt0) |v| try positionals.append(.{ .path = v });
-    if (csu.crti) |v| try positionals.append(.{ .path = v });
-    if (csu.crtbegin) |v| try positionals.append(.{ .path = v });
-
-    try positionals.ensureUnusedCapacity(comp.objects.len);
-    positionals.appendSliceAssumeCapacity(comp.objects);
-
-    // This is a set of object files emitted by clang in a single `build-exe` invocation.
-    // For instance, the implicit `a.o` as compiled by `zig build-exe a.c` will end up
-    // in this set.
-    for (comp.c_object_table.keys()) |key| {
-        try positionals.append(.{ .path = key.status.success.object_path });
-    }
-
-    if (module_obj_path) |path| try positionals.append(.{ .path = path });
-
-    // rpaths
     var rpath_table = std.StringArrayHashMap(void).init(gpa);
     defer rpath_table.deinit();
 
-    for (self.base.rpath_list) |rpath| {
-        _ = try rpath_table.put(rpath, {});
-    }
+    // Check in cache if we need to re-run object parsing.
+    tmp_log.debug("BEFORE", .{});
+    if (try self.incrementalCacheStale()) {
+        // TODO unwind the object state
 
-    if (comp.config.any_sanitize_thread) {
-        try positionals.append(.{ .path = comp.tsan_lib.?.full_object_path });
-    }
-
-    if (comp.config.any_fuzz) {
-        try positionals.append(.{ .path = comp.fuzzer_lib.?.full_object_path });
-    }
-
-    // libc
-    if (!comp.skip_linker_dependencies and !comp.config.link_libc) {
-        if (comp.libc_static_lib) |lib| {
-            try positionals.append(.{ .path = lib.full_object_path });
-        }
-    }
-
-    for (positionals.items) |obj| {
-        self.parsePositional(obj.path, obj.must_link) catch |err| switch (err) {
-            error.MalformedObject,
-            error.MalformedArchive,
-            error.MismatchedEflags,
-            error.InvalidMachineType,
-            => continue, // already reported
-            else => |e| try self.reportParseError(
-                obj.path,
-                "unexpected error: parsing input file failed with error {s}",
-                .{@errorName(e)},
-            ),
+        const csu = try CsuObjects.init(arena, comp);
+        const compiler_rt_path: ?[]const u8 = blk: {
+            if (comp.compiler_rt_lib) |x| break :blk x.full_object_path;
+            if (comp.compiler_rt_obj) |x| break :blk x.full_object_path;
+            break :blk null;
         };
-    }
 
-    var system_libs = std.ArrayList(SystemLib).init(arena);
+        // Here we will parse input positional and library files (if referenced).
+        // This will roughly match in any linker backend we support.
+        var positionals = std.ArrayList(Compilation.LinkObject).init(arena);
 
-    try system_libs.ensureUnusedCapacity(comp.system_libs.values().len);
-    for (comp.system_libs.values()) |lib_info| {
-        system_libs.appendAssumeCapacity(.{ .needed = lib_info.needed, .path = lib_info.path.? });
-    }
+        // csu prelude
+        if (csu.crt0) |v| try positionals.append(.{ .path = v });
+        if (csu.crti) |v| try positionals.append(.{ .path = v });
+        if (csu.crtbegin) |v| try positionals.append(.{ .path = v });
 
-    // libc++ dep
-    if (comp.config.link_libcpp) {
-        try system_libs.ensureUnusedCapacity(2);
-        system_libs.appendAssumeCapacity(.{ .path = comp.libcxxabi_static_lib.?.full_object_path });
-        system_libs.appendAssumeCapacity(.{ .path = comp.libcxx_static_lib.?.full_object_path });
-    }
+        try positionals.ensureUnusedCapacity(comp.objects.len);
+        positionals.appendSliceAssumeCapacity(comp.objects);
 
-    // libunwind dep
-    if (comp.config.link_libunwind) {
-        try system_libs.append(.{ .path = comp.libunwind_static_lib.?.full_object_path });
-    }
+        // This is a set of object files emitted by clang in a single `build-exe` invocation.
+        // For instance, the implicit `a.o` as compiled by `zig build-exe a.c` will end up
+        // in this set.
+        for (comp.c_object_table.keys()) |key| {
+            try positionals.append(.{ .path = key.status.success.object_path });
+        }
 
-    // libc dep
-    comp.link_error_flags.missing_libc = false;
-    if (comp.config.link_libc) {
-        if (comp.libc_installation) |lc| {
-            const flags = target_util.libcFullLinkFlags(target);
-            try system_libs.ensureUnusedCapacity(flags.len);
+        if (module_obj_path) |path| try positionals.append(.{ .path = path });
 
-            var test_path = std.ArrayList(u8).init(arena);
-            var checked_paths = std.ArrayList([]const u8).init(arena);
+        // rpaths
 
-            for (flags) |flag| {
-                checked_paths.clearRetainingCapacity();
-                const lib_name = flag["-l".len..];
+        for (self.base.rpath_list) |rpath| {
+            _ = try rpath_table.put(rpath, {});
+        }
 
-                success: {
-                    if (!self.base.isStatic()) {
-                        if (try self.accessLibPath(arena, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .dynamic))
+        if (comp.config.any_sanitize_thread) {
+            try positionals.append(.{ .path = comp.tsan_lib.?.full_object_path });
+        }
+
+        if (comp.config.any_fuzz) {
+            try positionals.append(.{ .path = comp.fuzzer_lib.?.full_object_path });
+        }
+
+        // libc
+        if (!comp.skip_linker_dependencies and !comp.config.link_libc) {
+            if (comp.libc_static_lib) |lib| {
+                try positionals.append(.{ .path = lib.full_object_path });
+            }
+        }
+
+        for (positionals.items) |obj| {
+            self.parsePositional(obj.path, obj.must_link) catch |err| switch (err) {
+                error.MalformedObject,
+                error.MalformedArchive,
+                error.MismatchedEflags,
+                error.InvalidMachineType,
+                => continue, // already reported
+                else => |e| try self.reportParseError(
+                    obj.path,
+                    "unexpected error: parsing input file failed with error {s}",
+                    .{@errorName(e)},
+                ),
+            };
+        }
+
+        var system_libs = std.ArrayList(SystemLib).init(arena);
+
+        try system_libs.ensureUnusedCapacity(comp.system_libs.values().len);
+        for (comp.system_libs.values()) |lib_info| {
+            system_libs.appendAssumeCapacity(.{ .needed = lib_info.needed, .path = lib_info.path.? });
+        }
+
+        // libc++ dep
+        if (comp.config.link_libcpp) {
+            try system_libs.ensureUnusedCapacity(2);
+            system_libs.appendAssumeCapacity(.{ .path = comp.libcxxabi_static_lib.?.full_object_path });
+            system_libs.appendAssumeCapacity(.{ .path = comp.libcxx_static_lib.?.full_object_path });
+        }
+
+        // libunwind dep
+        if (comp.config.link_libunwind) {
+            try system_libs.append(.{ .path = comp.libunwind_static_lib.?.full_object_path });
+        }
+
+        // libc dep
+        comp.link_error_flags.missing_libc = false;
+        if (comp.config.link_libc) {
+            if (comp.libc_installation) |lc| {
+                const flags = target_util.libcFullLinkFlags(target);
+                try system_libs.ensureUnusedCapacity(flags.len);
+
+                var test_path = std.ArrayList(u8).init(arena);
+                var checked_paths = std.ArrayList([]const u8).init(arena);
+
+                for (flags) |flag| {
+                    checked_paths.clearRetainingCapacity();
+                    const lib_name = flag["-l".len..];
+
+                    success: {
+                        if (!self.base.isStatic()) {
+                            if (try self.accessLibPath(arena, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .dynamic))
+                                break :success;
+                        }
+                        if (try self.accessLibPath(arena, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .static))
                             break :success;
+
+                        try self.reportMissingLibraryError(
+                            checked_paths.items,
+                            "missing system library: '{s}' was not found",
+                            .{lib_name},
+                        );
+
+                        continue;
                     }
-                    if (try self.accessLibPath(arena, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .static))
-                        break :success;
 
-                    try self.reportMissingLibraryError(
-                        checked_paths.items,
-                        "missing system library: '{s}' was not found",
-                        .{lib_name},
-                    );
-
-                    continue;
+                    const resolved_path = try arena.dupe(u8, test_path.items);
+                    system_libs.appendAssumeCapacity(.{ .path = resolved_path });
                 }
+            } else if (target.isGnuLibC()) {
+                try system_libs.ensureUnusedCapacity(glibc.libs.len + 1);
+                for (glibc.libs) |lib| {
+                    if (lib.removed_in) |rem_in| {
+                        if (target.os.version_range.linux.glibc.order(rem_in) != .lt) continue;
+                    }
 
-                const resolved_path = try arena.dupe(u8, test_path.items);
-                system_libs.appendAssumeCapacity(.{ .path = resolved_path });
-            }
-        } else if (target.isGnuLibC()) {
-            try system_libs.ensureUnusedCapacity(glibc.libs.len + 1);
-            for (glibc.libs) |lib| {
-                if (lib.removed_in) |rem_in| {
-                    if (target.os.version_range.linux.glibc.order(rem_in) != .lt) continue;
+                    const lib_path = try std.fmt.allocPrint(arena, "{s}{c}lib{s}.so.{d}", .{
+                        comp.glibc_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
+                    });
+                    system_libs.appendAssumeCapacity(.{ .path = lib_path });
                 }
-
-                const lib_path = try std.fmt.allocPrint(arena, "{s}{c}lib{s}.so.{d}", .{
-                    comp.glibc_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
+                system_libs.appendAssumeCapacity(.{
+                    .path = try comp.get_libc_crt_file(arena, "libc_nonshared.a"),
                 });
-                system_libs.appendAssumeCapacity(.{ .path = lib_path });
+            } else if (target.isMusl()) {
+                const path = try comp.get_libc_crt_file(arena, switch (link_mode) {
+                    .static => "libc.a",
+                    .dynamic => "libc.so",
+                });
+                try system_libs.append(.{ .path = path });
+            } else {
+                comp.link_error_flags.missing_libc = true;
             }
-            system_libs.appendAssumeCapacity(.{
-                .path = try comp.get_libc_crt_file(arena, "libc_nonshared.a"),
-            });
-        } else if (target.isMusl()) {
-            const path = try comp.get_libc_crt_file(arena, switch (link_mode) {
-                .static => "libc.a",
-                .dynamic => "libc.so",
-            });
-            try system_libs.append(.{ .path = path });
-        } else {
-            comp.link_error_flags.missing_libc = true;
+        }
+
+        for (system_libs.items) |lib| {
+            self.parseLibrary(lib, false) catch |err| switch (err) {
+                error.MalformedObject, error.MalformedArchive, error.InvalidMachineType => continue, // already reported
+                else => |e| try self.reportParseError(
+                    lib.path,
+                    "unexpected error: parsing library failed with error {s}",
+                    .{@errorName(e)},
+                ),
+            };
+        }
+
+        // Finally, as the last input objects we add compiler_rt and CSU postlude (if any).
+        positionals.clearRetainingCapacity();
+
+        // compiler-rt. Since compiler_rt exports symbols like `memset`, it needs
+        // to be after the shared libraries, so they are picked up from the shared
+        // libraries, not libcompiler_rt.
+        if (compiler_rt_path) |path| try positionals.append(.{ .path = path });
+
+        // csu postlude
+        if (csu.crtend) |v| try positionals.append(.{ .path = v });
+        if (csu.crtn) |v| try positionals.append(.{ .path = v });
+
+        for (positionals.items) |obj| {
+            self.parsePositional(obj.path, obj.must_link) catch |err| switch (err) {
+                error.MalformedObject,
+                error.MalformedArchive,
+                error.MismatchedEflags,
+                error.InvalidMachineType,
+                => continue, // already reported
+                else => |e| try self.reportParseError(
+                    obj.path,
+                    "unexpected error: parsing input file failed with error {s}",
+                    .{@errorName(e)},
+                ),
+            };
         }
     }
-
-    for (system_libs.items) |lib| {
-        self.parseLibrary(lib, false) catch |err| switch (err) {
-            error.MalformedObject, error.MalformedArchive, error.InvalidMachineType => continue, // already reported
-            else => |e| try self.reportParseError(
-                lib.path,
-                "unexpected error: parsing library failed with error {s}",
-                .{@errorName(e)},
-            ),
-        };
-    }
-
-    // Finally, as the last input objects we add compiler_rt and CSU postlude (if any).
-    positionals.clearRetainingCapacity();
-
-    // compiler-rt. Since compiler_rt exports symbols like `memset`, it needs
-    // to be after the shared libraries, so they are picked up from the shared
-    // libraries, not libcompiler_rt.
-    if (compiler_rt_path) |path| try positionals.append(.{ .path = path });
-
-    // csu postlude
-    if (csu.crtend) |v| try positionals.append(.{ .path = v });
-    if (csu.crtn) |v| try positionals.append(.{ .path = v });
-
-    for (positionals.items) |obj| {
-        self.parsePositional(obj.path, obj.must_link) catch |err| switch (err) {
-            error.MalformedObject,
-            error.MalformedArchive,
-            error.MismatchedEflags,
-            error.InvalidMachineType,
-            => continue, // already reported
-            else => |e| try self.reportParseError(
-                obj.path,
-                "unexpected error: parsing input file failed with error {s}",
-                .{@errorName(e)},
-            ),
-        };
-    }
+    tmp_log.debug("AFTER", .{});
 
     if (self.base.hasErrors()) return error.FlushFailure;
 
@@ -1101,6 +1127,138 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
     }
 
     if (self.base.hasErrors()) return error.FlushFailure;
+}
+
+/// Adds input files, paths and flags to cache and check if we need to redo the link of input objects.
+fn incrementalCacheStale(self: *Elf) !bool {
+    const cache = self.incremental_cache orelse return true;
+    var man = cache.obtain();
+    defer man.deinit();
+
+    const comp = self.base.comp;
+    const gpa = comp.gpa;
+    const target = self.getTarget();
+    const link_mode = comp.config.link_mode;
+
+    const csu = try CsuObjects.init(gpa, comp);
+
+    if (comp.compiler_rt_lib) |x| _ = try man.addFile(x.full_object_path, null);
+    if (comp.compiler_rt_obj) |x| _ = try man.addFile(x.full_object_path, null);
+
+    // csu prelude
+    if (csu.crt0) |v| _ = try man.addFile(v, null);
+    if (csu.crti) |v| _ = try man.addFile(v, null);
+    if (csu.crtbegin) |v| _ = try man.addFile(v, null);
+
+    // csu postlude
+    if (csu.crtend) |v| _ = try man.addFile(v, null);
+    if (csu.crtn) |v| _ = try man.addFile(v, null);
+
+    for (comp.objects) |obj| {
+        _ = try man.addFile(obj.path, null);
+        man.hash.add(obj.must_link);
+        man.hash.add(obj.loption);
+    }
+    for (comp.c_object_table.keys()) |key| {
+        const obj = key.status.success;
+        _ = try man.addFile(obj.object_path, null);
+    }
+
+    // rpaths
+    for (self.base.rpath_list) |rpath| {
+        man.hash.addBytes(rpath);
+    }
+
+    if (comp.config.any_sanitize_thread) {
+        _ = try man.addFile(comp.tsan_lib.?.full_object_path, null);
+    }
+
+    if (comp.config.any_fuzz) {
+        _ = try man.addFile(comp.fuzzer_lib.?.full_object_path, null);
+    }
+
+    // libc
+    if (!comp.skip_linker_dependencies and !comp.config.link_libc) {
+        if (comp.libc_static_lib) |lib| {
+            _ = try man.addFile(lib.full_object_path, null);
+        }
+    }
+
+    for (comp.system_libs.values()) |lib_info| {
+        _ = try man.addFile(lib_info.path.?, null);
+        man.hash.add(lib_info.needed);
+    }
+
+    // libc++ dep
+    if (comp.config.link_libcpp) {
+        _ = try man.addFile(comp.libcxxabi_static_lib.?.full_object_path, null);
+        _ = try man.addFile(comp.libcxx_static_lib.?.full_object_path, null);
+    }
+
+    // libunwind dep
+    if (comp.config.link_libunwind) {
+        _ = try man.addFile(comp.libunwind_static_lib.?.full_object_path, null);
+    }
+
+    // libc dep
+    if (comp.config.link_libc) {
+        if (comp.libc_installation) |lc| {
+            const flags = target_util.libcFullLinkFlags(target);
+            var test_path = std.ArrayList(u8).init(gpa);
+            defer test_path.deinit();
+            var checked_paths = std.ArrayList([]const u8).init(gpa);
+            defer checked_paths.deinit();
+
+            for (flags) |flag| {
+                checked_paths.clearRetainingCapacity();
+                const lib_name = flag["-l".len..];
+
+                success: {
+                    if (!self.base.isStatic()) {
+                        if (try self.accessLibPath(gpa, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .dynamic))
+                            break :success;
+                    }
+                    if (try self.accessLibPath(gpa, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .static))
+                        break :success;
+
+                    continue;
+                }
+
+                _ = try man.addFile(test_path.items, null);
+            }
+        } else if (target.isGnuLibC()) {
+            for (glibc.libs) |lib| {
+                if (lib.removed_in) |rem_in| {
+                    if (target.os.version_range.linux.glibc.order(rem_in) != .lt) continue;
+                }
+
+                const lib_path = try std.fmt.allocPrint(gpa, "{s}{c}lib{s}.so.{d}", .{
+                    comp.glibc_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
+                });
+                defer gpa.free(lib_path);
+                _ = try man.addFile(lib_path, null);
+            }
+            const lib_path = try comp.get_libc_crt_file(gpa, "libc_nonshared.a");
+            defer gpa.free(lib_path);
+            _ = try man.addFile(lib_path, null);
+        } else if (target.isMusl()) {
+            const path = try comp.get_libc_crt_file(gpa, switch (link_mode) {
+                .static => "libc.a",
+                .dynamic => "libc.so",
+            });
+            defer gpa.free(path);
+            _ = try man.addFile(path, null);
+        }
+    }
+
+    const is_hit = try man.hit();
+    _ = man.final();
+
+    if (!is_hit) try man.writeManifest();
+
+    tmp_log.debug("incremental cache stale: {}", .{!is_hit});
+
+    return !is_hit;
 }
 
 /// --verbose-link output
@@ -5744,6 +5902,7 @@ const assert = std.debug.assert;
 const elf = std.elf;
 const fs = std.fs;
 const log = std.log.scoped(.link);
+const tmp_log = std.log.scoped(.link_wip);
 const state_log = std.log.scoped(.link_state);
 const math = std.math;
 const mem = std.mem;
