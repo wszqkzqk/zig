@@ -152,6 +152,7 @@ comment_merge_section_index: ?MergeSection.Index = null,
 first_eflags: ?elf.Elf64_Word = null,
 
 incremental_cache: ?*Cache = null,
+link_id: [16]u8 = [_]u8{0} ** 16,
 
 /// When allocating, the ideal_capacity is calculated by
 /// actual_capacity + (actual_capacity / ideal_factor)
@@ -293,6 +294,11 @@ pub fn createEmpty(
         self.llvm_object = try LlvmObject.create(arena, comp);
     }
     errdefer self.base.destroy();
+
+    // TODO recover from the saved compiler state
+    {
+        std.crypto.random.bytes(&self.link_id);
+    }
 
     if (use_lld and (use_llvm or !comp.config.have_zcu)) {
         // LLVM emits the object file (if any); LLD links it into the final product.
@@ -1250,6 +1256,9 @@ fn incrementalCacheStale(self: *Elf) !bool {
             _ = try man.addFile(path, null);
         }
     }
+
+    // link_id
+    man.hash.addBytes(&self.link_id);
 
     const is_hit = try man.hit();
     _ = man.final();
