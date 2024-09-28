@@ -799,9 +799,8 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
     defer rpath_table.deinit();
 
     // Check in cache if we need to re-run object parsing.
-    tmp_log.debug("BEFORE", .{});
     if (try self.incrementalCacheStale()) {
-        // TODO unwind the object state
+        // TODO restore the object state
 
         const csu = try CsuObjects.init(arena, comp);
         const compiler_rt_path: ?[]const u8 = blk: {
@@ -984,7 +983,6 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
             };
         }
     }
-    tmp_log.debug("AFTER", .{});
 
     if (self.base.hasErrors()) return error.FlushFailure;
 
@@ -1138,15 +1136,19 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
 /// Adds input files, paths and flags to cache and check if we need to redo the link of input objects.
 fn incrementalCacheStale(self: *Elf) !bool {
     const cache = self.incremental_cache orelse return true;
+
+    const comp = self.base.comp;
+    var arena_allocator = std.heap.ArenaAllocator.init(comp.gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
     var man = cache.obtain();
     defer man.deinit();
 
-    const comp = self.base.comp;
-    const gpa = comp.gpa;
     const target = self.getTarget();
     const link_mode = comp.config.link_mode;
 
-    const csu = try CsuObjects.init(gpa, comp);
+    const csu = try CsuObjects.init(arena, comp);
 
     if (comp.compiler_rt_lib) |x| _ = try man.addFile(x.full_object_path, null);
     if (comp.compiler_rt_obj) |x| _ = try man.addFile(x.full_object_path, null);
@@ -1210,10 +1212,8 @@ fn incrementalCacheStale(self: *Elf) !bool {
     if (comp.config.link_libc) {
         if (comp.libc_installation) |lc| {
             const flags = target_util.libcFullLinkFlags(target);
-            var test_path = std.ArrayList(u8).init(gpa);
-            defer test_path.deinit();
-            var checked_paths = std.ArrayList([]const u8).init(gpa);
-            defer checked_paths.deinit();
+            var test_path = std.ArrayList(u8).init(arena);
+            var checked_paths = std.ArrayList([]const u8).init(arena);
 
             for (flags) |flag| {
                 checked_paths.clearRetainingCapacity();
@@ -1221,10 +1221,10 @@ fn incrementalCacheStale(self: *Elf) !bool {
 
                 success: {
                     if (!self.base.isStatic()) {
-                        if (try self.accessLibPath(gpa, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .dynamic))
+                        if (try self.accessLibPath(arena, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .dynamic))
                             break :success;
                     }
-                    if (try self.accessLibPath(gpa, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .static))
+                    if (try self.accessLibPath(arena, &test_path, &checked_paths, lc.crt_dir.?, lib_name, .static))
                         break :success;
 
                     continue;
@@ -1238,21 +1238,18 @@ fn incrementalCacheStale(self: *Elf) !bool {
                     if (target.os.version_range.linux.glibc.order(rem_in) != .lt) continue;
                 }
 
-                const lib_path = try std.fmt.allocPrint(gpa, "{s}{c}lib{s}.so.{d}", .{
+                const lib_path = try std.fmt.allocPrint(arena, "{s}{c}lib{s}.so.{d}", .{
                     comp.glibc_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
                 });
-                defer gpa.free(lib_path);
                 _ = try man.addFile(lib_path, null);
             }
-            const lib_path = try comp.get_libc_crt_file(gpa, "libc_nonshared.a");
-            defer gpa.free(lib_path);
+            const lib_path = try comp.get_libc_crt_file(arena, "libc_nonshared.a");
             _ = try man.addFile(lib_path, null);
         } else if (target.isMusl()) {
-            const path = try comp.get_libc_crt_file(gpa, switch (link_mode) {
+            const path = try comp.get_libc_crt_file(arena, switch (link_mode) {
                 .static => "libc.a",
                 .dynamic => "libc.so",
             });
-            defer gpa.free(path);
             _ = try man.addFile(path, null);
         }
     }
