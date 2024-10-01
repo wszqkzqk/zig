@@ -442,6 +442,7 @@ pub fn poll(
         .overlapped = [1]windows.OVERLAPPED{
             mem.zeroes(windows.OVERLAPPED),
         } ** enum_fields.len,
+        .byte_bufs = undefined,
         .active = .{
             .count = 0,
             .handles_buf = undefined,
@@ -481,6 +482,7 @@ pub fn Poller(comptime StreamEnum: type) type {
         windows: if (is_windows) struct {
             first_read_done: bool,
             overlapped: [enum_fields.len]windows.OVERLAPPED,
+            byte_bufs: [enum_fields.len]u8,
             active: struct {
                 count: math.IntFittingRange(0, enum_fields.len),
                 handles_buf: [enum_fields.len]windows.HANDLE,
@@ -534,16 +536,18 @@ pub fn Poller(comptime StreamEnum: type) type {
             const bump_amt = 512;
 
             if (!self.windows.first_read_done) {
-                // Windows Async IO requires an initial call to ReadFile before waiting on the handle
+                var already_read_data = false;
                 for (0..enum_fields.len) |i| {
                     const handle = self.windows.active.handles_buf[i];
-                    switch (try windowsAsyncRead(
+                    switch (try windowsAsyncReadToFifoAndQueueByteRead(
                         handle,
                         &self.windows.overlapped[i],
                         &self.fifos[i],
+                        &self.windows.byte_bufs[i],
                         bump_amt,
                     )) {
-                        .pending => {
+                        .populated, .empty => |state| {
+                            if (state == .populated) already_read_data = true;
                             self.windows.active.handles_buf[self.windows.active.count] = handle;
                             self.windows.active.stream_map[self.windows.active.count] = @as(StreamEnum, @enumFromInt(i));
                             self.windows.active.count += 1;
@@ -552,6 +556,7 @@ pub fn Poller(comptime StreamEnum: type) type {
                     }
                 }
                 self.windows.first_read_done = true;
+                if (already_read_data) return true;
             }
 
             while (true) {
@@ -578,11 +583,11 @@ pub fn Poller(comptime StreamEnum: type) type {
 
                 const handle = self.windows.active.handles_buf[active_idx];
                 const stream_idx = @intFromEnum(self.windows.active.stream_map[active_idx]);
-                var read_bytes: u32 = undefined;
+                var num_bytes_read: u32 = undefined;
                 if (0 == windows.kernel32.GetOverlappedResult(
                     handle,
                     &self.windows.overlapped[stream_idx],
-                    &read_bytes,
+                    &num_bytes_read,
                     0,
                 )) switch (windows.GetLastError()) {
                     .BROKEN_PIPE => {
@@ -592,15 +597,21 @@ pub fn Poller(comptime StreamEnum: type) type {
                     else => |err| return windows.unexpectedError(err),
                 };
 
-                self.fifos[stream_idx].update(read_bytes);
+                switch (num_bytes_read) {
+                    0 => {},
+                    1 => try self.fifos[stream_idx].write(&.{self.windows.byte_bufs[stream_idx]}),
+                    else => unreachable,
+                }
 
-                switch (try windowsAsyncRead(
+                switch (try windowsAsyncReadToFifoAndQueueByteRead(
                     handle,
                     &self.windows.overlapped[stream_idx],
                     &self.fifos[stream_idx],
+                    &self.windows.byte_bufs[stream_idx],
                     bump_amt,
                 )) {
-                    .pending => {},
+                    .empty => {}, // irrelevant, we already populated a byte
+                    .populated => {},
                     .closed => self.windows.active.removeAt(active_idx),
                 }
                 return true;
@@ -654,22 +665,88 @@ pub fn Poller(comptime StreamEnum: type) type {
     };
 }
 
-fn windowsAsyncRead(
+fn windowsAsyncReadToFifoAndQueueByteRead(
     handle: windows.HANDLE,
     overlapped: *windows.OVERLAPPED,
     fifo: *PollFifo,
+    byte_buf: *u8,
     bump_amt: usize,
-) !enum { pending, closed } {
+) !enum { empty, populated, closed } {
+    var read_any_data = false;
     while (true) {
-        const buf = try fifo.writableWithSize(bump_amt);
-        var read_bytes: u32 = undefined;
-        const read_result = windows.kernel32.ReadFile(handle, buf.ptr, math.cast(u32, buf.len) orelse math.maxInt(u32), &read_bytes, overlapped);
-        if (read_result == 0) return switch (windows.GetLastError()) {
-            .IO_PENDING => .pending,
-            .BROKEN_PIPE => .closed,
-            else => |err| windows.unexpectedError(err),
+        const fifo_read_pending = while (true) {
+            const buf = try fifo.writableWithSize(bump_amt);
+            const buf_len = math.cast(u32, buf.len) orelse math.maxInt(u32);
+
+            var num_bytes_read: u32 = undefined;
+            if (0 == windows.kernel32.ReadFile(
+                handle,
+                buf.ptr,
+                buf_len,
+                &num_bytes_read,
+                overlapped,
+            )) switch (windows.GetLastError()) {
+                .IO_PENDING => break true,
+                .BROKEN_PIPE => return .closed,
+                else => |err| return windows.unexpectedError(err),
+            };
+
+            read_any_data = true;
+            fifo.update(num_bytes_read);
+
+            if (num_bytes_read == buf_len) {
+                // We filled the buffer, so there's probably more data available.
+                continue;
+            } else {
+                // We didn't fill the buffer, so assume we're out of data.
+                // There is no pending read.
+                break false;
+            }
         };
-        fifo.update(read_bytes);
+
+        if (fifo_read_pending) cancel_read: {
+            // Cancel the pending read into the FIFO.
+            _ = windows.kernel32.CancelIo(handle);
+
+            // If it completed before we canceled, make sure to tell the FIFO!
+            var num_bytes_read: u32 = undefined;
+            if (0 == windows.kernel32.GetOverlappedResult(
+                handle,
+                overlapped,
+                &num_bytes_read,
+                0,
+            )) switch (windows.GetLastError()) {
+                .OPERATION_ABORTED => break :cancel_read,
+                .BROKEN_PIPE => return .closed,
+                else => |err| return windows.unexpectedError(err),
+            };
+            read_any_data = true;
+            fifo.update(num_bytes_read);
+        }
+
+        // Try to queue the 1-byte read.
+        var num_bytes_read: u32 = undefined;
+        if (0 == windows.kernel32.ReadFile(
+            handle,
+            byte_buf[0..1],
+            1,
+            &num_bytes_read,
+            overlapped,
+        )) switch (windows.GetLastError()) {
+            .IO_PENDING => {
+                // 1-byte read pending as intended
+                return if (read_any_data) .populated else .empty;
+            },
+            .BROKEN_PIPE => return .closed,
+            else => |err| return windows.unexpectedError(err),
+        };
+
+        // We actually got that byte back!
+        // Write it to the FIFO, and run the main loop again, filling the FIFO
+        // with whatever new data may be there.
+        read_any_data = true;
+        try fifo.write(&.{byte_buf.*});
+        byte_buf.* = undefined;
     }
 }
 
