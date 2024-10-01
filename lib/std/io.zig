@@ -708,6 +708,13 @@ fn windowsAsyncReadToFifoAndQueueByteRead(
             // Cancel the pending read into the FIFO.
             _ = windows.kernel32.CancelIo(handle);
 
+            // We have to wait for the handle to be signalled, i.e. for the cancellation to complete.
+            switch (windows.kernel32.WaitForSingleObject(handle, windows.INFINITE)) {
+                windows.WAIT_OBJECT_0 => {},
+                windows.WAIT_FAILED => return windows.unexpectedError(windows.GetLastError()),
+                else => unreachable,
+            }
+
             // If it completed before we canceled, make sure to tell the FIFO!
             var num_bytes_read: u32 = undefined;
             if (0 == windows.kernel32.GetOverlappedResult(
@@ -716,6 +723,7 @@ fn windowsAsyncReadToFifoAndQueueByteRead(
                 &num_bytes_read,
                 0,
             )) switch (windows.GetLastError()) {
+                .IO_INCOMPLETE => unreachable, // we just made sure it was complete
                 .OPERATION_ABORTED => break :cancel_read,
                 .BROKEN_PIPE => return .closed,
                 else => |err| return windows.unexpectedError(err),
