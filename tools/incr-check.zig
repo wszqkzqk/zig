@@ -95,7 +95,7 @@ pub fn main() !void {
         };
         defer target_prog_node.end();
 
-        if (debug_log_verbose or true) {
+        if (debug_log_verbose) {
             std.log.scoped(.status).info("target: '{s}-{s}'", .{ target.query, @tagName(target.backend) });
         }
 
@@ -183,7 +183,7 @@ pub fn main() !void {
             var update_node = target_prog_node.start(update.name, 0);
             defer update_node.end();
 
-            if (debug_log_verbose or true) {
+            if (debug_log_verbose) {
                 std.log.scoped(.status).info("update: '{s}'", .{update.name});
             }
 
@@ -196,8 +196,6 @@ pub fn main() !void {
 
         waitChild(&child, &eval);
     }
-
-    std.time.sleep(10 * std.time.ns_per_ms);
 }
 
 const Eval = struct {
@@ -403,7 +401,6 @@ const Eval = struct {
 
         const run_prog_node = prog_node.start("run generated executable", 0);
         defer run_prog_node.end();
-        std.log.scoped(.status).info("run executable", .{});
 
         const result = std.process.Child.run(.{
             .allocator = eval.arena,
@@ -457,7 +454,6 @@ const Eval = struct {
         }
 
         if (!is_foreign and result.stderr.len != 0) std.process.exit(1);
-        std.log.scoped(.status).info("executable run completed", .{});
     }
 
     fn requestUpdate(eval: *Eval) !void {
@@ -495,8 +491,6 @@ const Eval = struct {
 
     fn buildCOutput(eval: *Eval, update: Case.Update, c_path: []const u8, out_path: []const u8, prog_node: std.Progress.Node) !void {
         std.debug.assert(eval.cc_child_args.items.len > 0);
-
-        std.log.scoped(.status).info("building cbe output", .{});
 
         const child_prog_node = prog_node.start("build cbe output", 0);
         defer child_prog_node.end();

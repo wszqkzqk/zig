@@ -1484,8 +1484,7 @@ pub fn addIncrementalTests(b: *std.Build, test_step: *Step) !void {
         run.addFileArg(b.path("test/incremental/").path(b, entry.path));
         run.addArgs(&.{ "--zig-lib-dir", b.fmt("{}", .{b.graph.zig_lib_directory}) });
 
-        //run.addCheck(.{ .expect_term = .{ .Exited = 0 } });
-        run.stdio = .inherit;
+        run.addCheck(.{ .expect_term = .{ .Exited = 0 } });
 
         test_step.dependOn(&run.step);
     }
