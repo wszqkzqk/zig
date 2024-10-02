@@ -442,7 +442,7 @@ pub fn poll(
         .overlapped = [1]windows.OVERLAPPED{
             mem.zeroes(windows.OVERLAPPED),
         } ** enum_fields.len,
-        .byte_bufs = undefined,
+        .small_bufs = undefined,
         .active = .{
             .count = 0,
             .handles_buf = undefined,
@@ -482,7 +482,7 @@ pub fn Poller(comptime StreamEnum: type) type {
         windows: if (is_windows) struct {
             first_read_done: bool,
             overlapped: [enum_fields.len]windows.OVERLAPPED,
-            byte_bufs: [enum_fields.len]u8,
+            small_bufs: [enum_fields.len][128]u8,
             active: struct {
                 count: math.IntFittingRange(0, enum_fields.len),
                 handles_buf: [enum_fields.len]windows.HANDLE,
@@ -539,11 +539,11 @@ pub fn Poller(comptime StreamEnum: type) type {
                 var already_read_data = false;
                 for (0..enum_fields.len) |i| {
                     const handle = self.windows.active.handles_buf[i];
-                    switch (try windowsAsyncReadToFifoAndQueueByteRead(
+                    switch (try windowsAsyncReadToFifoAndQueueSmallRead(
                         handle,
                         &self.windows.overlapped[i],
                         &self.fifos[i],
-                        &self.windows.byte_bufs[i],
+                        &self.windows.small_bufs[i],
                         bump_amt,
                     )) {
                         .populated, .empty => |state| {
@@ -597,17 +597,13 @@ pub fn Poller(comptime StreamEnum: type) type {
                     else => |err| return windows.unexpectedError(err),
                 };
 
-                switch (num_bytes_read) {
-                    0 => {},
-                    1 => try self.fifos[stream_idx].write(&.{self.windows.byte_bufs[stream_idx]}),
-                    else => unreachable,
-                }
+                try self.fifos[stream_idx].write(self.windows.small_bufs[stream_idx][0..num_bytes_read]);
 
-                switch (try windowsAsyncReadToFifoAndQueueByteRead(
+                switch (try windowsAsyncReadToFifoAndQueueSmallRead(
                     handle,
                     &self.windows.overlapped[stream_idx],
                     &self.fifos[stream_idx],
-                    &self.windows.byte_bufs[stream_idx],
+                    &self.windows.small_bufs[stream_idx],
                     bump_amt,
                 )) {
                     .empty => {}, // irrelevant, we already populated a byte
@@ -665,11 +661,11 @@ pub fn Poller(comptime StreamEnum: type) type {
     };
 }
 
-fn windowsAsyncReadToFifoAndQueueByteRead(
+fn windowsAsyncReadToFifoAndQueueSmallRead(
     handle: windows.HANDLE,
     overlapped: *windows.OVERLAPPED,
     fifo: *PollFifo,
-    byte_buf: *u8,
+    small_buf: *[128]u8,
     bump_amt: usize,
 ) !enum { empty, populated, closed } {
     var read_any_data = false;
@@ -739,8 +735,8 @@ fn windowsAsyncReadToFifoAndQueueByteRead(
         var num_bytes_read: u32 = undefined;
         if (0 == windows.kernel32.ReadFile(
             handle,
-            byte_buf[0..1],
-            1,
+            small_buf,
+            small_buf.len,
             &num_bytes_read,
             overlapped,
         )) switch (windows.GetLastError()) {
@@ -752,12 +748,10 @@ fn windowsAsyncReadToFifoAndQueueByteRead(
             else => |err| return windows.unexpectedError(err),
         };
 
-        // We actually got that byte back!
-        // Write it to the FIFO, and run the main loop again, filling the FIFO
-        // with whatever new data may be there.
+        // We actually got some data back now! Write it to the FIFO and run the main loop
+        // again, filling the FIFO with whatever new data may be there.
         read_any_data = true;
-        try fifo.write(&.{byte_buf.*});
-        byte_buf.* = undefined;
+        try fifo.write(small_buf[0..num_bytes_read]);
     }
 }
 
