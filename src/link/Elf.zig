@@ -4963,6 +4963,7 @@ const RelaDyn = struct {
     sym: u64 = 0,
     type: u32,
     addend: i64 = 0,
+    target: ?*const Symbol = null,
 };
 
 pub fn addRelaDyn(self: *Elf, opts: RelaDyn) !void {
@@ -4971,6 +4972,13 @@ pub fn addRelaDyn(self: *Elf, opts: RelaDyn) !void {
 }
 
 pub fn addRelaDynAssumeCapacity(self: *Elf, opts: RelaDyn) void {
+    relocs_log.debug("  {s}: [{x} => {d}({s})] + {x}", .{
+        relocation.fmtRelocType(opts.type, self.getTarget().cpu.arch),
+        opts.offset,
+        opts.sym,
+        if (opts.target) |sym| sym.name(self) else "",
+        opts.addend,
+    });
     self.rela_dyn.appendAssumeCapacity(.{
         .r_offset = opts.offset,
         .r_info = (opts.sym << 32) | opts.type,
@@ -5881,6 +5889,7 @@ const assert = std.debug.assert;
 const elf = std.elf;
 const fs = std.fs;
 const log = std.log.scoped(.link);
+const relocs_log = std.log.scoped(.link_relocs);
 const tmp_log = std.log.scoped(.link_wip);
 const state_log = std.log.scoped(.link_state);
 const math = std.math;
