@@ -690,6 +690,7 @@ fn windowsAsyncReadToFifoAndQueueByteRead(
                 .BROKEN_PIPE => return .closed,
                 else => |err| return windows.unexpectedError(err),
             };
+            std.debug.print("read {} bytes\n", .{num_bytes_read});
 
             read_any_data = true;
             fifo.update(num_bytes_read);
@@ -728,11 +729,13 @@ fn windowsAsyncReadToFifoAndQueueByteRead(
                 .BROKEN_PIPE => return .closed,
                 else => |err| return windows.unexpectedError(err),
             };
+            std.debug.print("read {} bytes\n", .{num_bytes_read});
             read_any_data = true;
             fifo.update(num_bytes_read);
         }
 
         // Try to queue the 1-byte read.
+        std.debug.print("queue 1-byte read\n", .{});
         var num_bytes_read: u32 = undefined;
         if (0 == windows.kernel32.ReadFile(
             handle,
